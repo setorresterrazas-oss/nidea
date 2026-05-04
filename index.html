@@ -386,6 +386,9 @@ const ID_RANKS = [
 
 // ── UTILS ────────────────────────────────────────────────
 
+// Times per week for each frequency label
+const FREQ_NUM = { 'Diario':7, '4x/sem':4, '2x/sem':2, 'Semanal':1 };
+
 function today() {
   const d = new Date();
   return d.getFullYear() + '-' +
@@ -393,18 +396,108 @@ function today() {
     String(d.getDate()).padStart(2, '0');
 }
 
-function calcStreak(hist) {
+// Local date string from a Date object (avoids UTC shift)
+function localStr(d) {
+  return d.getFullYear() + '-' +
+    String(d.getMonth()+1).padStart(2,'0') + '-' +
+    String(d.getDate()).padStart(2,'0');
+}
+
+// Add n days to a dateStr, returns new dateStr
+function addDays(dateStr, n) {
+  const d = new Date(dateStr + 'T12:00:00');
+  d.setDate(d.getDate() + n);
+  return localStr(d);
+}
+
+// Get Monday of the week containing dateStr
+function weekMonday(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00');
+  const day = d.getDay(); // 0=Sun
+  const diff = day === 0 ? -6 : 1 - day;
+  d.setDate(d.getDate() + diff);
+  return localStr(d);
+}
+
+// Get all 7 dates (Mon–Sun) of a week given its Monday
+function datesInWeek(mondayStr) {
+  return Array.from({length:7}, (_, i) => addDays(mondayStr, i));
+}
+
+// ── STREAK (frequency-aware) ──────────────────────────────
+
+function calcStreak(hist, freqStr) {
   if (!hist || !hist.length) return 0;
-  const set = new Set(hist);
-  let cur = new Date(today());
-  if (!set.has(today())) cur.setDate(cur.getDate() - 1);
-  let s = 0;
-  for (let i = 0; i < 1000; i++) {
-    const ds = cur.toISOString().split('T')[0];
-    if (set.has(ds)) { s++; cur.setDate(cur.getDate() - 1); }
-    else break;
+  const freq = FREQ_NUM[freqStr] || 7;
+  const set  = new Set(hist);
+  const td   = today();
+
+  if (freq === 7) {
+    // Daily: classic consecutive-days streak
+    let cur = new Date(td + 'T12:00:00');
+    if (!set.has(td)) cur.setDate(cur.getDate() - 1);
+    let s = 0;
+    for (let i = 0; i < 1000; i++) {
+      if (set.has(localStr(cur))) { s++; cur.setDate(cur.getDate() - 1); }
+      else break;
+    }
+    return s;
   }
-  return s;
+
+  // Non-daily: count consecutive weeks where quota was met.
+  // Returns weeks × 7 so the rank thresholds still make sense.
+  let monday = weekMonday(td);
+  let streakWeeks = 0;
+
+  for (let w = 0; w < 200; w++) {
+    const dates       = datesInWeek(monday);
+    const completions = dates.filter(d => set.has(d)).length;
+
+    if (w === 0) {
+      // Current week: ok if quota already met OR still achievable
+      const todayIdx  = dates.indexOf(td);
+      const daysLeft  = 6 - todayIdx; // days after today this week
+      if (completions >= freq) {
+        streakWeeks++; // quota done
+      } else if (completions + daysLeft >= freq) {
+        // still reachable — don't count the week yet but don't break either
+      } else {
+        break; // impossible to recover this week
+      }
+    } else {
+      if (completions >= freq) streakWeeks++;
+      else break;
+    }
+
+    monday = addDays(monday, -7);
+  }
+
+  return streakWeeks * 7;
+}
+
+// ── SHIELDS (remaining days you can skip this week) ───────
+
+function getShields(hist, freqStr) {
+  const freq = FREQ_NUM[freqStr] || 7;
+  if (freq === 7) return null; // daily → no shields concept
+
+  const total = 7 - freq;
+  const set   = new Set(hist);
+  const td    = today();
+  const mon   = weekMonday(td);
+  const dates = datesInWeek(mon);
+  const idx   = dates.indexOf(td); // 0=Mon … 6=Sun
+
+  const daysLeftIncToday     = 7 - idx;            // includes today
+  const completionsThisWeek  = dates.slice(0, idx + 1).filter(d => set.has(d)).length;
+
+  // How many of the remaining days can I still skip?
+  const remaining = Math.min(total, Math.max(0,
+    daysLeftIncToday + completionsThisWeek - freq
+  ));
+  const used = total - remaining;
+
+  return { total, remaining, used, completions: completionsThisWeek, freq };
 }
 
 function getRank(v, arr) {
@@ -420,8 +513,8 @@ function progress(v, cur, nxt) {
   if (!nxt) return 100;
   return Math.min(100, Math.round(((v - cur.m) / (nxt.m - cur.m)) * 100));
 }
-function calcPoints(d) {
-  const s = calcStreak(d.hist);
+function calcPoints(d, freqStr) {
+  const s = calcStreak(d.hist, freqStr);
   return d.tot + Math.floor(s / 7) * 3;
 }
 
@@ -473,10 +566,12 @@ function toggle(id) {
     // keep 150 days
     const cut = new Date(); cut.setDate(cut.getDate() - 150);
     d.hist = d.hist.filter(x => new Date(x) >= cut);
-    const s = calcStreak(d.hist);
-    d.best = Math.max(d.best || 0, s);
     const h = HABITS.find(x => x.id === id);
-    showToast(h.name, s, getRank(s, HABIT_RANKS).n);
+    const s = calcStreak(d.hist, h.f);
+    d.best = Math.max(d.best || 0, s);
+    const sh = getShields(d.hist, h.f);
+    const shMsg = sh ? ` · 🛡 ${sh.remaining}/${sh.total}` : '';
+    showToast(h.name, s, getRank(s, HABIT_RANKS).n + shMsg);
   }
   saveData(D);
   render();
@@ -498,7 +593,7 @@ function render() {
 
   // identity points
   const ip = { c:0, a:0, t:0 };
-  HABITS.forEach(h => ip[h.k] += calcPoints(D[h.id]));
+  HABITS.forEach(h => ip[h.k] += calcPoints(D[h.id], h.f));
 
   // identity cards
   const idGrid = document.getElementById('identity-grid');
@@ -553,11 +648,25 @@ function render() {
       hl.forEach(h => {
         const d = D[h.id] || { hist:[], best:0, tot:0 };
         const isDone = d.hist.includes(td);
-        const s = calcStreak(d.hist);
-        const pts = calcPoints(d);
-        const rk = getRank(s, HABIT_RANKS);
+        const s   = calcStreak(d.hist, h.f);
+        const pts = calcPoints(d, h.f);
+        const rk  = getRank(s, HABIT_RANKS);
         const nxt = getNext(s, HABIT_RANKS);
-        const pr = progress(s, rk, nxt);
+        const pr  = progress(s, rk, nxt);
+        const sh  = getShields(d.hist, h.f);
+
+        // Build shield icons string
+        let shieldHTML = '';
+        if (sh) {
+          const icons = Array.from({length: sh.total}, (_, i) => {
+            const active = i < sh.remaining;
+            return `<span style="font-size:11px;opacity:${active ? 1 : 0.2}">${active ? '🛡' : '🛡'}</span>`;
+          }).join('');
+          const label = sh.remaining === 0 && sh.completions < sh.freq
+            ? `<span style="font-size:10px;color:#ef4444;font-weight:600">¡Hazlo ya!</span>`
+            : `<span style="font-size:10px;color:var(--muted2)">${sh.completions}/${sh.freq} esta sem</span>`;
+          shieldHTML = `<div style="display:flex;align-items:center;gap:4px;margin-top:3px;flex-wrap:wrap">${icons} ${label}</div>`;
+        }
 
         const item = document.createElement('div');
         item.className = `habit-item ${isDone ? 'done ' + k : ''}`;
@@ -569,10 +678,11 @@ function render() {
               <span class="habit-freq">${h.f}</span>
               <span class="habit-rank-tag rank-tag-${k}">${rk.n}</span>
             </div>
+            ${shieldHTML}
           </div>
           <div class="habit-right">
             <div class="habit-pts ${k}">${pts}</div>
-            ${s > 0 ? `<div class="habit-streak">${s}d</div>` : ''}
+            ${s > 0 ? `<div class="habit-streak">${Math.round(s/7) > 0 && sh ? Math.round(s/7)+'sem' : s+'d'}</div>` : ''}
             ${s > 0 && nxt ? `<div class="habit-streak-bar"><div class="habit-streak-fill streak-fill-${k}" style="width:${pr}%"></div></div>` : ''}
           </div>
         `;
